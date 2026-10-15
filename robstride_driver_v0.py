@@ -181,6 +181,11 @@ class RobStrideDriver:
     # ---------------------------------------------------------------
     # Tang truyen thong
     # ---------------------------------------------------------------
+    def _pace_tx_locked(self):
+        delay = getattr(self.ser, "_robstride_next_tx_at", 0.0) - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
     def _write_all_locked(self, frame):
         """Finish a short serial write without retransmitting its AT header.
 
@@ -188,6 +193,10 @@ class RobStrideDriver:
         retrying a whole partially written frame could corrupt the byte stream.
         The real serial port also has a bounded write_timeout.
         """
+        # All seven drivers share this serial object. Pace across driver
+        # boundaries as well as within one request; fast 3ms replies must not
+        # turn telemetry into back-to-back TX bursts to the AT bridge.
+        self._pace_tx_locked()
         offset = 0
         deadline = time.monotonic() + 0.15
         while offset < len(frame):
@@ -204,6 +213,7 @@ class RobStrideDriver:
             if time.monotonic() >= deadline:
                 raise serial.SerialTimeoutException("Serial TX queue did not drain within 0.15s")
             time.sleep(0.001)
+        self.ser._robstride_next_tx_at = time.monotonic() + 0.006
 
     def _send_raw(self, raw_bytes, wait=0.02):
         with self._lock:
@@ -308,6 +318,10 @@ class RobStrideDriver:
             observed_statuses = []
             outcome = "timeout"
             try:
+                # Drain stale RX after pacing, immediately before this TX.
+                # Otherwise an earlier reply arriving during the gap could
+                # incorrectly confirm the upcoming request.
+                self._pace_tx_locked()
                 pending = self.ser.in_waiting
                 if pending:
                     discarded = self.ser.read(pending)
@@ -355,8 +369,12 @@ class RobStrideDriver:
                     f"discarded={discarded[-64:].hex() or '-'} rx={received.hex() or '-'} parsed={parsed}"
                 )
                 command_type = (int.from_bytes(frame[2:6], "big") >> 27) & 0x1F
-                if self.diagnostic_sink is not None and command_type in (COMM_ENABLE, COMM_STOP, COMM_WRITE_PARAM):
+                failed_read = (command_type == COMM_READ_PARAM and outcome != "matched"
+                               and time.monotonic() - getattr(self, "_last_read_error_log_at", -math.inf) >= 1.0)
+                if self.diagnostic_sink is not None and (failed_read or command_type in (COMM_ENABLE, COMM_STOP, COMM_WRITE_PARAM, COMM_SET_ZERO)):
                     try:
+                        if failed_read:
+                            self._last_read_error_log_at = time.monotonic()
                         self.diagnostic_sink("COMMAND_IO " + self._last_request_detail)
                     except Exception:
                         pass  # Diagnostic output must not prevent motor cleanup.
@@ -428,6 +446,42 @@ class RobStrideDriver:
 
     def set_zero(self):
         self._send(COMM_SET_ZERO, self.host_id, [1] + [0] * 7, 0.05)
+
+    def write_mode_stopped(self, run_mode, stop_event, retries=3):
+        """Caller has confirmed STOP. Keep the existing Type 18/17 encoding."""
+        for attempt in range(retries):
+            if stop_event.is_set():
+                return False
+            self.write_param_u8(REG_RUN_MODE, run_mode, wait=0.006)
+            if self.read_param_u8(REG_RUN_MODE, timeout=0.10) == run_mode:
+                return True
+        return False
+
+    def set_zero_verified(self, stop_event, tolerance_rad, retries=3):
+        """Disabled motor in Motion/CSP mode; repeat Type 6 only if unverified.
+
+        Both 260112 manuals block zero calibration in PP mode (section 4.2.6).
+        The application selects/restores the mode while keeping the motor off.
+        """
+        frame = self._frame(COMM_SET_ZERO, self.host_id, [1] + [0]*7)
+        self._last_zero_position = None
+        for attempt in range(retries):
+            if stop_event.is_set():
+                return False
+            reply = self._request_response(frame, COMM_FEEDBACK, lambda payload: True,
+                                           0.10, return_frame=True)
+            if reply is not None and (reply[0] >> 16) & 0x3F:
+                raise RuntimeError(f"M{self.motor_id}: ZERO feedback fault bits 0x{(reply[0] >> 16) & 0x3F:02X}")
+            # Readback also covers a lost Type 2 ACK. Never accept ACK alone.
+            for read_attempt in range(3):
+                if stop_event.is_set():
+                    return False
+                position = self.read_param(REG_MECH_POS, timeout=0.10)
+                if position is not None and math.isfinite(position) and abs(position) <= tolerance_rad:
+                    self._last_zero_position = position
+                    return True
+                time.sleep(0.01)
+        return False
 
     def set_mode(self, run_mode, retries=3):
         """Precautions #2 trong manual: khong doi mode khi dang chay - phai dung truoc."""
@@ -601,10 +655,14 @@ class RobStrideDriver:
 
         ret_pos, ret_vel, ret_cur = None, None, None
 
-        payload = self._request_response(
-            frame, COMM_FEEDBACK, lambda data: True, timeout,
+        reply = self._request_response(
+            frame, COMM_FEEDBACK, lambda data: True, timeout, return_frame=True,
         )
-        if payload is not None:
+        if reply is not None:
+            can_id, payload = reply
+            faults = (can_id >> 16) & 0x3F
+            if faults:
+                raise RuntimeError(f"M{self.motor_id}: MIT feedback fault bits 0x{faults:02X}")
             p_raw, v_raw, t_raw, _ = struct.unpack(">HHHH", payload)
             ret_pos = (float(p_raw) / 65535.0) * (p_hi - p_lo) + p_lo
             ret_vel = (float(v_raw) / 65535.0) * (2.0 * self.profile.v_max) - self.profile.v_max
@@ -692,7 +750,7 @@ def main():
     import sys
     gui_path = Path(__file__).resolve().with_name("gui_3motor_pc.py")
     print("Day la thu vien driver RobStride, khong phai chuong trinh GUI.")
-    print("De dieu khien 3 motor tren Windows, chay:")
+    print("De dieu khien 7 motor tren Windows, chay:")
     print(f'"{sys.executable}" "{gui_path}"')
     print("Mo GUI, nhap cong COM va bam Ket noi. Driver chay rieng khong mo COM hay gui CAN.")
 

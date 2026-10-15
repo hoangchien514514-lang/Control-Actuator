@@ -1,0 +1,11 @@
+{
+  "motors": [
+    {"id": 1, "profile": "EL05"},
+    {"id": 2, "profile": "RS00"},
+    {"id": 3, "profile": "RS00"},
+    {"id": 4, "profile": "EL05"},
+    {"id": 5, "profile": "EL05"},
+    {"id": 6, "profile": "EL05"},
+    {"id": 7, "profile": "RS00"}
+  ]
+}
